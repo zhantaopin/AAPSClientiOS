@@ -131,7 +131,8 @@ jobs:
             2>&1 | tee build.log
 
       - name: Test
-        if: (success() || failure()) && inputs.run_tests
+        # `inputs.run_tests` only exists on workflow_dispatch; push runs default to true.
+        if: (success() || failure()) && (inputs.run_tests == '' || inputs.run_tests == true)
         run: |
           set -o pipefail
           xcodebuild test-without-building \
