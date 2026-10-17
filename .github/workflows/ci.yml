@@ -21,6 +21,11 @@ on:
         type: boolean
         default: true
         required: false
+      build_unsigned_ipa:
+        description: "Build an unsigned release IPA for AltStore/Sideloadly (personal free Apple ID)"
+        type: boolean
+        default: false
+        required: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -202,3 +207,152 @@ jobs:
         # Guards against precheck.py silently degrading into something that always
         # passes. Restores every file it mutates, so the checkout stays pristine.
         run: python scripts/precheck_selftest.py
+
+  build-unsigned-ipa:
+    # Produces an unsigned Release IPA installable via AltStore / Sideloadly / TrollStore.
+    # No Apple Developer Program membership, no certificates, no provisioning profiles
+    # are required — the user re-signs locally with their free personal Apple ID
+    # (7-day validity for AltStore/Sideloadly, or permanent if TrollStore-compatible).
+    #
+    # Entitlements (keychain-access-groups, app groups, time-sensitive notifications)
+    # are embedded in the .app bundle at build time, so the re-signed IPA retains all
+    # capabilities after AltStore/Sideloadly injects its own signature.
+    #
+    # Trigger only when the checkbox is ticked — this adds a second macOS runner and
+    # doubles the billing minutes for that run.
+    if: inputs.build_unsigned_ipa == true
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record the toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Create unsigned signing config
+        # No team, no identity, no signing. The build produces a fully-formed .app
+        # bundle whose entitlements are copied from the .entitlements files into the
+        # bundle — these are plain file copies, independent of code signing.
+        run: |
+          printf 'DEVELOPMENT_TEAM =\nCODE_SIGN_IDENTITY =\nCODE_SIGNING_REQUIRED = NO\nCODE_SIGNING_ALLOWED = NO\n' \
+            > Config/Local.xcconfig
+          cat Config/Local.xcconfig
+
+      - name: Generate the Xcode project
+        run: |
+          xcodegen generate
+          xcodebuild -project AAPSClientiOS.xcodeproj -list
+
+      - name: Verify the generated Info.plist matches the tracked one
+        run: |
+          if ! git diff --quiet -- App/Info.plist; then
+            echo "::error file=App/Info.plist::App/Info.plist is stale - run 'xcodegen generate' and commit the result"
+            git --no-pager diff -- App/Info.plist
+            exit 1
+          fi
+          echo "Info.plist is in sync with project.yml"
+
+      - name: Archive (Release, unsigned)
+        # Archive against generic iOS device so we get a fat arm64 + arm64e binary.
+        # -allowProvisioningUpdates is harmless here (signing is disabled globally)
+        # but kept because some Xcode builds otherwise error on missing profiles.
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project AAPSClientiOS.xcodeproj \
+            -scheme AAPSClientiOS \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/AAPSClientiOS.xcarchive \
+            -configuration Release \
+            -allowProvisioningUpdates \
+            CODE_SIGN_IDENTITY= \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM= \
+            ONLY_ACTIVE_ARCH=NO \
+            2>&1 | tee archive.log
+
+      - name: Write export options for unsigned IPA
+        # development method + manual signing + no profile references produces a
+        # package that any re-signer (AltStore, Sideloadly) can consume directly.
+        # `uploadSymbols` is off — that requires App Store Connect access.
+        run: |
+          cat > ExportOptions-AdHoc.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>development</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string></string>
+            <key>provisioningProfiles</key>
+            <dict/>
+            <key>uploadSymbols</key>
+            <false/>
+          </dict>
+          </plist>
+          PLIST
+          cat ExportOptions-AdHoc.plist
+
+      - name: Export unsigned IPA
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive \
+            -archivePath build/AAPSClientiOS.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist ExportOptions-AdHoc.plist \
+            -allowProvisioningUpdates \
+            CODE_SIGN_IDENTITY= \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee export.log
+          echo "---"
+          ls -la build/export/*.ipa 2>/dev/null || { echo "::error::No IPA produced — see export.log"; exit 1; }
+
+      - name: Verify the IPA is unsigned
+        # Quick sanity: AltStore/Sideloadly re-signers expect the app binary to
+        # carry no embedded signature. This check saves the user from downloading
+        # a "pre-signed" IPA that won't install on their device.
+        run: |
+          IPA=$(ls build/export/*.ipa | head -1)
+          echo "Checking $IPA"
+          unzip -o "$IPA" -d build/ipa_extract > /dev/null
+          APP_PATH=$(find build/ipa_extract -name 'AAPSClientiOS.app' -type d | head -1)
+          if [ -z "$APP_PATH" ]; then echo "::error::.app bundle not found inside IPA"; exit 1; fi
+          echo "App bundle: $APP_PATH"
+          # codesign --verify fails on unsigned binaries — that's what we want.
+          if codesign --verify --deep --strict "$APP_PATH" 2>/dev/null; then
+            echo "::error::IPA is already signed — AltStore will refuse to re-sign it."
+            exit 1
+          else
+            echo "OK — IPA is unsigned, ready for AltStore/Sideloadly."
+          fi
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AAPSClientiOS-unsigned
+          path: build/export/*.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-build-logs
+          path: |
+            archive.log
+            export.log
+          retention-days: 14
+          if-no-files-found: warn
