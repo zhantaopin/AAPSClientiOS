@@ -269,45 +269,26 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             2>&1 | tee archive.log
 
-      - name: Write export options for unsigned IPA
-        # development method + manual signing + no profile references produces a
-        # package that any re-signer (AltStore, Sideloadly) can consume directly.
-        # `uploadSymbols` is off — that requires App Store Connect access.
-        run: |
-          cat > ExportOptions-AdHoc.plist <<'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>development</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>teamID</key>
-            <string></string>
-            <key>provisioningProfiles</key>
-            <dict/>
-            <key>uploadSymbols</key>
-            <false/>
-          </dict>
-          </plist>
-          PLIST
-          cat ExportOptions-AdHoc.plist
-
-      - name: Export unsigned IPA
+      - name: Package unsigned IPA (manual zip)
+        # IPA is just a zip of Payload/<AppName>.app — we build it directly from
+        # the .xcarchive, bypassing `xcodebuild -exportArchive` which requires a
+        # non-empty team ID / provisioning profile even when CODE_SIGNING_ALLOWED=NO.
+        # AltStore, Sideloadly and TrollStore only care about the .app bundle inside;
+        # they never inspect ExportOptions.plist.
         run: |
           set -o pipefail
-          xcodebuild -exportArchive \
-            -archivePath build/AAPSClientiOS.xcarchive \
-            -exportPath build/export \
-            -exportOptionsPlist ExportOptions-AdHoc.plist \
-            -allowProvisioningUpdates \
-            CODE_SIGN_IDENTITY= \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            2>&1 | tee export.log
-          echo "---"
-          ls -la build/export/*.ipa 2>/dev/null || { echo "::error::No IPA produced — see export.log"; exit 1; }
+          APP_DIR=$(find build/AAPSClientiOS.xcarchive/Products -name '*.app' -type d | head -1)
+          if [ -z "$APP_DIR" ]; then echo "::error::No .app found inside xcarchive"; exit 1; fi
+          echo "Found app: $APP_DIR"
+          APP_NAME=$(basename "$APP_DIR")
+          mkdir -p build/export/Payload
+          cp -R "$APP_DIR" "build/export/Payload/$APP_NAME"
+          # ditto preserves symlinks + extended attributes better than zip -r
+          IPA_PATH="build/export/AAPSClientiOS.ipa"
+          ditto -c -k --sequesterRsrc --keepParent build/export/Payload "$IPA_PATH"
+          rm -rf build/export/Payload
+          ls -la "$IPA_PATH"
+          echo "IPA size: $(du -h "$IPA_PATH" | cut -f1)"
 
       - name: Verify the IPA is unsigned
         # Quick sanity: AltStore/Sideloadly re-signers expect the app binary to
