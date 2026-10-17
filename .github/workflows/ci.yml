@@ -6,26 +6,19 @@ name: CI
 # prints every distinct error at the end rather than failing on the first one.
 # `scripts/precheck.py` catches the cheap classes of mistake locally before you get here.
 
-# On demand only. A macOS runner costs ~8 minutes and 10x the billing minutes of a
-# Linux one, and most pushes on this branch do not need a compile — the local
-# pre-flight (scripts/precheck.py, with a real `swiftc -parse` when a toolchain is
-# installed) covers the fast feedback. Trigger a run with:
-#     gh workflow run CI --ref <branch>
-#     gh workflow run CI --ref <branch> -f run_tests=false     # compile only
-# or from the Actions tab.
+# Push-triggered + manual. Every push builds an unsigned IPA (personal free Apple ID,
+# AltStore/Sideloadly/TrollStore-compatible) as an artifact — no App Store account,
+# certificates or provisioning profiles needed. The local pre-flight
+# (scripts/precheck.py, with a real `swiftc -parse` when a toolchain is installed)
+# catches fast mistakes before you push.
+#
+# NOTE: macOS runners cost ~80 billing minutes per run (10x Linux rate). GitHub Free
+# accounts get 2000 billing minutes/month — that's ~25 IPA builds. Tag the workflow
+# or swap to a cheaper trigger if you start hitting the limit.
 on:
+  push:
+    branches: [main, master]
   workflow_dispatch:
-    inputs:
-      run_tests:
-        description: "Run the test suite after building"
-        type: boolean
-        default: true
-        required: false
-      build_unsigned_ipa:
-        description: "Build an unsigned release IPA for AltStore/Sideloadly (personal free Apple ID)"
-        type: boolean
-        default: false
-        required: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -217,10 +210,6 @@ jobs:
     # Entitlements (keychain-access-groups, app groups, time-sensitive notifications)
     # are embedded in the .app bundle at build time, so the re-signed IPA retains all
     # capabilities after AltStore/Sideloadly injects its own signature.
-    #
-    # Trigger only when the checkbox is ticked — this adds a second macOS runner and
-    # doubles the billing minutes for that run.
-    if: inputs.build_unsigned_ipa == true
     runs-on: macos-latest
     timeout-minutes: 45
 
